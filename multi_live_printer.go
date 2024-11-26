@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -13,9 +14,26 @@ var DefaultMultiPrinter = MultiPrinter{
 	printers:    []LivePrinter{},
 	Writer:      os.Stdout,
 	UpdateDelay: time.Millisecond * 200,
+	buffers:     []*syncBuffer{},
+	area:        DefaultArea,
+}
 
-	buffers: []*bytes.Buffer{},
-	area:    DefaultArea,
+// syncBuffer wraps bytes.Buffer with a mutex for thread safety
+type syncBuffer struct {
+	mu  sync.RWMutex
+	buf bytes.Buffer
+}
+
+func (sb *syncBuffer) Write(p []byte) (n int, err error) {
+	sb.mu.Lock()
+	defer sb.mu.Unlock()
+	return sb.buf.Write(p)
+}
+
+func (sb *syncBuffer) String() string {
+	sb.mu.RLock()
+	defer sb.mu.RUnlock()
+	return sb.buf.String()
 }
 
 type MultiPrinter struct {
@@ -23,36 +41,41 @@ type MultiPrinter struct {
 	Writer      io.Writer
 	UpdateDelay time.Duration
 
+	mu       sync.RWMutex // protects printers and buffers
 	printers []LivePrinter
-	buffers  []*bytes.Buffer
+	buffers  []*syncBuffer
 	area     AreaPrinter
 }
 
-// SetWriter sets the writer for the AreaPrinter.
 func (p *MultiPrinter) SetWriter(writer io.Writer) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	p.Writer = writer
 }
 
-// WithWriter returns a fork of the MultiPrinter with a new writer.
 func (p MultiPrinter) WithWriter(writer io.Writer) *MultiPrinter {
 	p.Writer = writer
 	return &p
 }
 
-// WithUpdateDelay returns a fork of the MultiPrinter with a new update delay.
 func (p MultiPrinter) WithUpdateDelay(delay time.Duration) *MultiPrinter {
 	p.UpdateDelay = delay
 	return &p
 }
 
 func (p *MultiPrinter) NewWriter() io.Writer {
-	buf := bytes.NewBufferString("")
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	buf := &syncBuffer{}
 	p.buffers = append(p.buffers, buf)
 	return buf
 }
 
-// getString returns all buffers appended and separated by a newline.
 func (p *MultiPrinter) getString() string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
 	var buffer bytes.Buffer
 	for _, b := range p.buffers {
 		s := b.String()
@@ -62,9 +85,8 @@ func (p *MultiPrinter) getString() string {
 		s = parts[len(parts)-1]
 
 		// check if s is empty, if so get one part before, repeat until not empty
-		for s == "" {
-			parts = parts[:len(parts)-1]
-			s = parts[len(parts)-1]
+		for i := len(parts) - 1; i >= 0 && s == ""; i-- {
+			s = parts[i]
 		}
 
 		s = strings.Trim(s, "\n\r")
@@ -75,18 +97,23 @@ func (p *MultiPrinter) getString() string {
 }
 
 func (p *MultiPrinter) Start() (*MultiPrinter, error) {
+	p.mu.Lock()
 	p.IsActive = true
 	for _, printer := range p.printers {
 		printer.GenericStart()
 	}
+	p.mu.Unlock()
 
 	schedule.Every(p.UpdateDelay, func() bool {
-		if !p.IsActive {
+		p.mu.RLock()
+		isActive := p.IsActive
+		p.mu.RUnlock()
+
+		if !isActive {
 			return false
 		}
 
 		p.area.Update(p.getString())
-
 		return true
 	})
 
@@ -94,10 +121,13 @@ func (p *MultiPrinter) Start() (*MultiPrinter, error) {
 }
 
 func (p *MultiPrinter) Stop() (*MultiPrinter, error) {
+	p.mu.Lock()
 	p.IsActive = false
 	for _, printer := range p.printers {
 		printer.GenericStop()
 	}
+	p.mu.Unlock()
+
 	time.Sleep(time.Millisecond * 20)
 	p.area.Update(p.getString())
 	p.area.Stop()
@@ -105,18 +135,12 @@ func (p *MultiPrinter) Stop() (*MultiPrinter, error) {
 	return p, nil
 }
 
-// GenericStart runs Start, but returns a LivePrinter.
-// This is used for the interface LivePrinter.
-// You most likely want to use Start instead of this in your program.
 func (p MultiPrinter) GenericStart() (*LivePrinter, error) {
 	p2, _ := p.Start()
 	lp := LivePrinter(p2)
 	return &lp, nil
 }
 
-// GenericStop runs Stop, but returns a LivePrinter.
-// This is used for the interface LivePrinter.
-// You most likely want to use Stop instead of this in your program.
 func (p MultiPrinter) GenericStop() (*LivePrinter, error) {
 	p2, _ := p.Stop()
 	lp := LivePrinter(p2)
