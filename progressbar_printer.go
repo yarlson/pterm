@@ -8,16 +8,18 @@ import (
 	"math"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gookit/color"
-
 	"github.com/pterm/pterm/internal"
 )
 
 // ActiveProgressBarPrinters contains all running ProgressbarPrinters.
-// Generally, there should only be one active ProgressbarPrinter at a time.
-var ActiveProgressBarPrinters []*ProgressbarPrinter
+var (
+	activeProgressBarPrintersMu sync.RWMutex
+	ActiveProgressBarPrinters   []*ProgressbarPrinter
+)
 
 // DefaultProgressbar is the default ProgressbarPrinter.
 var DefaultProgressbar = ProgressbarPrinter{
@@ -38,6 +40,7 @@ var DefaultProgressbar = ProgressbarPrinter{
 
 // ProgressbarPrinter shows a progress animation in the terminal.
 type ProgressbarPrinter struct {
+	mu                        sync.RWMutex
 	Title                     string
 	Total                     int
 	Current                   int
@@ -170,16 +173,22 @@ func (p ProgressbarPrinter) WithWriter(writer io.Writer) *ProgressbarPrinter {
 
 // SetWriter sets the custom Writer.
 func (p *ProgressbarPrinter) SetWriter(writer io.Writer) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	p.Writer = writer
 }
 
 // SetStartedAt sets the time when the ProgressbarPrinter started.
 func (p *ProgressbarPrinter) SetStartedAt(t time.Time) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	p.startedAt = t
 }
 
 // ResetTimer resets the timer of the ProgressbarPrinter.
 func (p *ProgressbarPrinter) ResetTimer() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	p.startedAt = time.Now()
 }
 
@@ -191,18 +200,22 @@ func (p *ProgressbarPrinter) Increment() *ProgressbarPrinter {
 
 // UpdateTitle updates the title and re-renders the progressbar
 func (p *ProgressbarPrinter) UpdateTitle(title string) *ProgressbarPrinter {
+	p.mu.Lock()
 	p.Title = title
+	p.mu.Unlock()
 	p.updateProgress()
 	return p
 }
 
-// This is the update logic, renders the progressbar
 func (p *ProgressbarPrinter) updateProgress() *ProgressbarPrinter {
 	Fprinto(p.Writer, p.getString())
 	return p
 }
 
 func (p *ProgressbarPrinter) getString() string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
 	if !p.IsActive {
 		return ""
 	}
@@ -266,15 +279,23 @@ func (p *ProgressbarPrinter) getString() string {
 
 // Add to current value.
 func (p *ProgressbarPrinter) Add(count int) *ProgressbarPrinter {
+	p.mu.Lock()
 	if p.Total == 0 {
+		p.mu.Unlock()
 		return nil
 	}
 
 	p.Current += count
+	currentValue := p.Current
+	total := p.Total
+	p.mu.Unlock()
+
 	p.updateProgress()
 
-	if p.Current >= p.Total {
-		p.Total = p.Current
+	if currentValue >= total {
+		p.mu.Lock()
+		p.Total = currentValue
+		p.mu.Unlock()
 		p.updateProgress()
 		p.Stop()
 	}
@@ -283,52 +304,79 @@ func (p *ProgressbarPrinter) Add(count int) *ProgressbarPrinter {
 
 // Start the ProgressbarPrinter.
 func (p ProgressbarPrinter) Start(title ...any) (*ProgressbarPrinter, error) {
+	newP := &p // Create a new instance
+
 	cursor.Hide()
-	if RawOutput && p.ShowTitle {
-		Fprintln(p.Writer, p.Title)
+
+	newP.mu.Lock()
+	if RawOutput && newP.ShowTitle {
+		Fprintln(newP.Writer, newP.Title)
 	}
-	p.IsActive = true
+	newP.IsActive = true
 	if len(title) != 0 {
-		p.Title = Sprint(title...)
+		newP.Title = Sprint(title...)
 	}
-	ActiveProgressBarPrinters = append(ActiveProgressBarPrinters, &p)
-	p.startedAt = time.Now()
+	newP.startedAt = time.Now()
+	newP.mu.Unlock()
 
-	p.updateProgress()
+	activeProgressBarPrintersMu.Lock()
+	ActiveProgressBarPrinters = append(ActiveProgressBarPrinters, newP)
+	activeProgressBarPrintersMu.Unlock()
 
-	if p.ShowElapsedTime {
-		p.rerenderTask = schedule.Every(time.Second, func() bool {
-			p.updateProgress()
+	newP.updateProgress()
+
+	if newP.ShowElapsedTime {
+		newP.rerenderTask = schedule.Every(time.Second, func() bool {
+			if !newP.IsActive {
+				return false
+			}
+			newP.updateProgress()
 			return true
 		})
 	}
 
-	return &p, nil
+	return newP, nil
 }
 
 // Stop the ProgressbarPrinter.
 func (p *ProgressbarPrinter) Stop() (*ProgressbarPrinter, error) {
+	p.mu.Lock()
 	if p.rerenderTask != nil && p.rerenderTask.IsActive() {
 		p.rerenderTask.Stop()
 	}
-	cursor.Show()
 
 	if !p.IsActive {
+		p.mu.Unlock()
 		return p, nil
 	}
 	p.IsActive = false
-	if p.RemoveWhenDone {
-		fClearLine(p.Writer)
-		Fprinto(p.Writer)
+
+	removeWhenDone := p.RemoveWhenDone
+	writer := p.Writer
+	p.mu.Unlock()
+
+	cursor.Show()
+
+	if removeWhenDone {
+		fClearLine(writer)
+		Fprinto(writer)
 	} else {
-		Fprintln(p.Writer)
+		Fprintln(writer)
 	}
+
+	activeProgressBarPrintersMu.Lock()
+	for i, bar := range ActiveProgressBarPrinters {
+		if bar == p {
+			ActiveProgressBarPrinters = append(ActiveProgressBarPrinters[:i], ActiveProgressBarPrinters[i+1:]...)
+			break
+		}
+	}
+	activeProgressBarPrintersMu.Unlock()
+
 	return p, nil
 }
 
 // GenericStart runs Start, but returns a LivePrinter.
-// This is used for the interface LivePrinter.
-// You most likely want to use Start instead of this in your program.
 func (p *ProgressbarPrinter) GenericStart() (*LivePrinter, error) {
 	p2, _ := p.Start()
 	lp := LivePrinter(p2)
@@ -336,8 +384,6 @@ func (p *ProgressbarPrinter) GenericStart() (*LivePrinter, error) {
 }
 
 // GenericStop runs Stop, but returns a LivePrinter.
-// This is used for the interface LivePrinter.
-// You most likely want to use Stop instead of this in your program.
 func (p *ProgressbarPrinter) GenericStop() (*LivePrinter, error) {
 	p2, _ := p.Stop()
 	lp := LivePrinter(p2)
@@ -346,10 +392,11 @@ func (p *ProgressbarPrinter) GenericStop() (*LivePrinter, error) {
 
 // GetElapsedTime returns the elapsed time, since the ProgressbarPrinter was started.
 func (p *ProgressbarPrinter) GetElapsedTime() time.Duration {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	return time.Since(p.startedAt)
 }
 
 func (p *ProgressbarPrinter) parseElapsedTime() string {
-	s := p.GetElapsedTime().Round(p.ElapsedTimeRoundingFactor).String()
-	return s
+	return p.GetElapsedTime().Round(p.ElapsedTimeRoundingFactor).String()
 }
